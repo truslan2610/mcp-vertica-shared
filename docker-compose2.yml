@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  mcp-service:
+    image: truslan26/mcp-vertica:latest
+    container_name: mcp-vertica-shared
+    restart: unless-stopped
+    ports:
+      - "8081:8081" # Или любой другой свободный порт, например 80
+    environment:
+      # Включает режим SSE для поддержки MCP клиентов (например, Claude Desktop)
+      - TRANSPORT=sse
+      # Порт, который слушает приложение внутри контейнера
+      - PORT=8081
+      # Уровень логирования (опционально)
+      - DEBUG=1
+      - LOG_LEVEL=DEBUG
+      
+      # Параметры подключения к Vertica (из логов)
+      # Проверьте точные имена переменных в документации образа, 
+      # ниже приведены наиболее вероятные варианты:
+      # - VERTICA_HOST=host.docker.internal
+      # - VERTICA_PORT=89
+      # - VERTICA_DATABASE=ndwh02
+      # - VERTICA_USER=ruslan.tkachenko
+      # - VERTICA_PASSWORD=6bfd542e4a7b2433b2056
+      - VERTICA_SSL=false
+      - VERTICA_SSL_REJECT_UNAUTHORIZED=false
+
+    # Настройка лимитов ресурсов (рекомендуется)
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+
+    # Важно: Контейнер должен видеть DNS или IP адрес сервера Vertica
+    extra_hosts:
+      - "vertica-prod.internal:192.168.1.100" # Пример добавления хоста, если нет внутреннего DNS

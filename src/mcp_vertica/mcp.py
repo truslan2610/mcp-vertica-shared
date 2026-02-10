@@ -22,6 +22,9 @@ logger = logging.getLogger("mcp-vertica")
 # Log version at module load time
 logger.info(f"Loading mcp_vertica version: {__version__}")
 
+# Global storage for configuration to persist across requests
+GLOBAL_ENV_CACHE = {}
+
 
 class ConfigMiddleware(BaseHTTPMiddleware):
     """Middleware to parse Smithery config from URL parameters and set environment variables."""
@@ -42,8 +45,12 @@ class ConfigMiddleware(BaseHTTPMiddleware):
         """Parse URL parameters and set environment variables before processing request."""
         # Get query parameters
         params = dict(request.query_params)
+        
+        # print(f"DEBUG: Middleware received request: {request.method} {request.url}")
+        # print(f"DEBUG: Params: {params.keys()}")
 
         # Map config parameters to environment variables
+        vars_set = []
         for config_key, env_var in self.CONFIG_MAPPING.items():
             if config_key in params:
                 value = params[config_key]
@@ -51,8 +58,18 @@ class ConfigMiddleware(BaseHTTPMiddleware):
                 if isinstance(value, str):
                     if value.lower() in ("true", "false"):
                         value = value.lower()
-                os.environ[env_var] = str(value)
-                logger.debug(f"Set {env_var}={value} from URL parameter {config_key}")
+                
+                str_value = str(value)
+                os.environ[env_var] = str_value
+                GLOBAL_ENV_CACHE[env_var] = str_value
+                if env_var == "VERTICA_PASSWORD":
+                    vars_set.append(f"{env_var}=***")
+                else:
+                    vars_set.append(f"{env_var}={str_value}")
+        
+        if vars_set:
+             print(f"ConfigMiddleware: Updated environment variables: {', '.join(vars_set)}")
+             # print(f"DEBUG: GLOBAL_ENV_CACHE keys: {list(GLOBAL_ENV_CACHE.keys())}")
 
         response = await call_next(request)
         return response
@@ -68,15 +85,77 @@ async def get_or_create_manager(ctx: Context) -> VerticaConnectionManager | None
         VerticaConnectionManager instance or None if creation fails
     """
     manager = ctx.request_context.lifespan_context.get("vertica_manager")
-    if not manager:
+    
+    # Check if we have cached environment variables and restore them
+    if GLOBAL_ENV_CACHE:
+        # print(f"DEBUG: Restoring {len(GLOBAL_ENV_CACHE)} vars from cache before creating/checking manager.")
+        for k, v in GLOBAL_ENV_CACHE.items():
+            # Force restore to ensure we have the latest from ANY previous request
+            if os.environ.get(k) != v:
+                os.environ[k] = v
+                # print(f"DEBUG: Restored {k} from cache")
+    else:
+        # print("DEBUG: No global env cache found.")
+        pass
+
+    # Check current environment configuration
+    try:
+        current_config = VerticaConfig.from_env()
+    except Exception as e:
+        await ctx.error(f"Failed to parse configuration from environment: {str(e)}")
+        return None
+
+    if manager:
+        # If manager exists, check if we need to reconfigure it
+        if manager.config != current_config:
+            # logger.info("Configuration changed, re-initializing connection manager")
+            print("Configuration changed, re-initializing connection manager")
+            try:
+                manager.close_all()
+            except Exception as e:
+                logger.warning(f"Error closing old connections: {e}")
+            
+            try:
+                manager.initialize_default(current_config)
+            except Exception as e:
+                await ctx.error(f"Failed to re-initialize manager: {str(e)}")
+                return None
+    else:
+        # No manager in context, create one
         try:
             manager = VerticaConnectionManager()
-            config = VerticaConfig.from_env()
-            manager.initialize_default(config)
+            manager.initialize_default(current_config)
             await ctx.info("Connection manager initialized from request config")
         except Exception as e:
             await ctx.error(f"Failed to initialize database connection: {str(e)}")
             return None
+            
+    return manager
+
+    if manager:
+        # If manager exists, check if we need to reconfigure it
+        if manager.config != current_config:
+            logger.info("Configuration changed, re-initializing connection manager")
+            try:
+                manager.close_all()
+            except Exception as e:
+                logger.warning(f"Error closing old connections: {e}")
+            
+            try:
+                manager.initialize_default(current_config)
+            except Exception as e:
+                await ctx.error(f"Failed to re-initialize manager: {str(e)}")
+                return None
+    else:
+        # No manager in context, create one
+        try:
+            manager = VerticaConnectionManager()
+            manager.initialize_default(current_config)
+            await ctx.info("Connection manager initialized from request config")
+        except Exception as e:
+            await ctx.error(f"Failed to initialize database connection: {str(e)}")
+            return None
+            
     return manager
 
 
@@ -159,6 +238,19 @@ async def run_sse(port: int = 8000) -> None:
         port: Port to listen on for SSE transport
     """
     starlette_app = Starlette(routes=[Mount("/", app=mcp.sse_app())])
+    
+    # Add config middleware to parse Smithery URL parameters in SSE mode too
+    starlette_app.add_middleware(ConfigMiddleware)
+    
+    # Add CORS middleware to support browser-based clients
+    starlette_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     config = uvicorn.Config(starlette_app, host="0.0.0.0", port=port)  # noqa: S104
     app = uvicorn.Server(config)
     await app.serve()
